@@ -1,0 +1,15 @@
+torch>=2.0.1
+git+https://github.com/taidopurason/transformers@LUMI
+accelerate
+appdirs
+loralib
+black
+black[jupyter]
+datasets
+fire
+peft
+sentencepiece
+py7zr
+scipy
+optimum
+wandb
