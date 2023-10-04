@@ -13,7 +13,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 from transformers import HfArgumentParser, TrainingArguments, Trainer, LlamaForCausalLM, LlamaTokenizer, \
-    default_data_collator, DataCollatorForSeq2Seq, get_polynomial_decay_schedule_with_warmup
+    default_data_collator, DataCollatorForSeq2Seq, get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
 from torch.utils.data import Dataset
 from transformers.utils import PaddingStrategy
 
@@ -254,14 +254,25 @@ class CustomTrainer(Trainer):
                 isinstance(self.args, CustomTrainingArguments) and
                 self.args.scheduler_lr_end is not None
         ):
-            assert self.args.lr_scheduler_type == "cosine"
-            logging.info(f"Using cosine with learning rate with end lr {self.args.scheduler_lr_end}")
-            self.lr_scheduler = get_polynomial_decay_schedule_with_warmup(
-                optimizer=self.optimizer if optimizer is None else optimizer,
-                lr_end=self.args.scheduler_lr_end,
-                num_training_steps=num_training_steps,
-                num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+            logging.info(
+                f"Using {self.args.lr_scheduler_type} with learning rate with end lr {self.args.scheduler_lr_end}"
             )
+            if self.args.lr_scheduler_type == "polynomial":
+                self.lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    lr_end=self.args.scheduler_lr_end,
+                    num_training_steps=num_training_steps,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                )
+            elif self.args.lr_scheduler_type == "cosine":
+                self.lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=self.optimizer if optimizer is None else optimizer,
+                    lr_end=self.args.scheduler_lr_end,
+                    num_training_steps=num_training_steps,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                )
+            else:
+                raise ValueError(f"lr scheduler {self.args.lr_scheduler_type} not supported with scheduler_lr_end")
             self._created_lr_scheduler = True
             return self.lr_scheduler
 
