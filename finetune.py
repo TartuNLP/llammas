@@ -13,7 +13,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 from transformers import HfArgumentParser, TrainingArguments, Trainer, LlamaForCausalLM, LlamaTokenizer, \
-    default_data_collator, DataCollatorForSeq2Seq, DataCollatorWithPadding
+    default_data_collator, DataCollatorForSeq2Seq, get_polynomial_decay_schedule_with_warmup
 from torch.utils.data import Dataset
 from transformers.utils import PaddingStrategy
 
@@ -242,6 +242,32 @@ def peft_module_casting_to_bf16(model, args: TrainingArguments):
                     module = module.to(torch.bfloat16)
 
 
+@dataclass
+class CustomTrainingArguments(TrainingArguments):
+    scheduler_lr_end: float = None
+
+
+class CustomTrainer(Trainer):
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        if (
+                self.lr_scheduler is None and
+                isinstance(self.args, CustomTrainingArguments) and
+                self.args.scheduler_lr_end is not None
+        ):
+            assert self.args.lr_scheduler_type == "cosine"
+            logging.info(f"Using cosine with learning rate with end lr {self.args.scheduler_lr_end}")
+            self.lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+                optimizer=self.optimizer if optimizer is None else optimizer,
+                lr_end=self.args.scheduler_lr_end,
+                num_training_steps=num_training_steps,
+                num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+            )
+            self._created_lr_scheduler = True
+            return self.lr_scheduler
+
+        return super().create_scheduler(num_training_steps, optimizer)
+
+
 def main(script_args: ScriptArguments, training_args: TrainingArguments, quantization_args: QuantizationArguments,
          lora_args: LoraArguments):
     torch.cuda.manual_seed(training_args.seed)
@@ -272,7 +298,7 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
     logging.info(f"Validation dataset with {len(eval_dataset)} examples")
     logging.info(f"Max sequence length: {tokenizer.model_max_length}")
     # trainer
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -307,7 +333,7 @@ if __name__ == "__main__":
         stream=sys.stdout,
     )
 
-    parser = HfArgumentParser([ScriptArguments, TrainingArguments, QuantizationArguments, LoraArguments])
+    parser = HfArgumentParser([ScriptArguments, CustomTrainingArguments, QuantizationArguments, LoraArguments])
     args, training_args, quant_args, lora_args = parser.parse_args_into_dataclasses()
     main(
         script_args=args,
