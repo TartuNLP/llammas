@@ -60,21 +60,18 @@ def main(
         full_output_file: Optional[str] = None,
         quantization: bool = False,
         compile_model: bool = False,
-        max_new_tokens=100,  # The maximum numbers of tokens to generate
+        max_new_tokens: int = 100,
         prompt_file: str = None,
-        seed: int = 42,  # seed value for reproducibility
-        do_sample: bool = True,  # Whether or not to use sampling ; use greedy decoding otherwise.
-        min_length: int = None,  # The minimum length of the sequence to be generated, input prompt + min_new_tokens
+        seed: int = 42,
+        do_sample: bool = True,
+        min_length: int = None,
         use_cache: bool = True,
-        # [optional] Whether or not the model should use the past last key/values attentions Whether or not the model should use the past last key/values attentions (if applicable to the model) to speed up decoding.
         top_p: float = 1.0,
         num_beams: int = 1,
-        # [optional] If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to top_p or higher are kept for generation.
-        temperature: float = 1.0,  # [optional] The value used to modulate the next token probabilities.
-        top_k: int = 50,  # [optional] The number of highest probability vocabulary tokens to keep for top-k-filtering.
-        repetition_penalty: float = 1.0,  # The parameter for repetition penalty. 1.0 means no penalty.
+        temperature: float = 1.0,
+        top_k: int = 50,
+        repetition_penalty: float = 1.0,
         length_penalty: int = 1,
-        # [optional] Exponential penalty to the length that is used with beam-based generation.
         batch_size: int = 8,
         print_output: bool = False,
         **kwargs
