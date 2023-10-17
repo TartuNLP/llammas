@@ -216,10 +216,6 @@ class ScriptArguments:
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
-    use_better_transformer: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables Flash attention for training."},
-    )
     use_dynamic_padding: bool = field(default=False)
     disable_padding: bool = field(default=False)
     use_new_pad_token: bool = field(default=False)
@@ -350,9 +346,6 @@ def create_and_prepare_model(args: ScriptArguments, training_args: TrainingArgum
         use_cache=not training_args.gradient_checkpointing,
         trust_remote_code=True,
     )
-    if args.use_better_transformer:
-        from optimum.bettertransformer import BetterTransformer
-        model = BetterTransformer.transform(model)
 
     peft_config = None
     if lora_args.use_peft_lora:
@@ -524,10 +517,6 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
     if trainer.is_fsdp_enabled:
         trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
 
-    if args.use_better_transformer:
-        from optimum.bettertransformer import BetterTransformer
-        trainer.model = BetterTransformer.reverse(trainer.model)
-        model = trainer.model
 
     trainer.save_model(training_args.output_dir)
 
