@@ -473,13 +473,11 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
     torch.manual_seed(training_args.seed)
     random.seed(training_args.seed)
 
-    # model
     model, peft_config, tokenizer = create_and_prepare_model(
         script_args, training_args, lora_args, quantization_args
     )
     model.config.use_cache = False
 
-    # datasets
     train_dataset, eval_dataset = create_datasets(tokenizer, args)
     if args.use_dynamic_padding:
         logging.info("Using dynamic padding")
@@ -497,7 +495,6 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
     logging.info(f"Train dataset with {len(train_dataset)} examples")
     logging.info(f"Validation dataset with {len(eval_dataset)} examples")
     logging.info(f"Max sequence length: {tokenizer.model_max_length}")
-    # trainer
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -510,13 +507,10 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
         trainer.model.print_trainable_parameters()
         peft_module_casting_to_bf16(trainer.model, training_args)
 
-    # train
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
-    # saving final model
     if trainer.is_fsdp_enabled:
         trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
-
 
     trainer.save_model(training_args.output_dir)
 
