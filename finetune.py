@@ -150,10 +150,15 @@ PROMPT_DICT = {
     ),
 }
 
+def read_json(path: str):
+    with open(path, "r", encoding="utf-8") as user_file:
+        parsed_json = json.load(user_file)
+    return parsed_json
+
 
 class InstructionDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: LlamaTokenizer, padding=True):
-        self.dataset = json.load(open(data_path))
+        self.dataset = read_json(data_path)
         self.padding = padding
         self.tokenizer = tokenizer
 
@@ -194,6 +199,83 @@ class InstructionDataset(Dataset):
             "input_ids": example,
             "labels": labels,
             "attention_mask": example_mask,
+        }
+
+
+class ChatDataset(Dataset):
+    SYSTEM_PREFIX = "<|system|>\n"
+    SYSTEM_SUFFIX = "\n"
+    ASSISTANT_PREFIX = "<|assistant|>\n"
+    ASSISTANT_SUFFIX = "\n"
+    USER_PREFIX = "<|user|>\n"
+    USER_SUFFIX = "\n"
+
+    def __init__(self, data_path: str, tokenizer: LlamaTokenizer):
+        self.dataset = read_json(data_path)
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _concat_messages(self, messages):
+        message_text = ""
+        for message in messages:
+            if message["role"] == "system":
+                message_text += self.SYSTEM_PREFIX + message["content"].strip() + self.SYSTEM_SUFFIX
+            elif message["role"] == "user":
+                message_text += self.USER_PREFIX + message["content"].strip() + self.USER_SUFFIX
+            elif message["role"] == "assistant":
+                message_text += self.ASSISTANT_PREFIX + message["content"].strip() + self.tokenizer.eos_token \
+                                + self.ASSISTANT_SUFFIX
+            else:
+                raise ValueError("Invalid role: {}".format(message["role"]))
+        return message_text
+
+    def __getitem__(self, index):
+        IGNORE_INDEX = -100
+
+        messages = self.dataset[index]["messages"]
+        if len(messages) == 0:
+            raise ValueError('messages field is empty.')
+
+        example_text = self._concat_messages(messages).strip()
+        tokenized_example = self.tokenizer(example_text, return_tensors='pt', max_length=self.tokenizer.model_max_length, truncation=True)
+        input_ids = tokenized_example.input_ids
+        labels = input_ids.clone()
+
+        # mask the non-assistant part for avoiding loss
+        for message_idx, message in enumerate(messages):
+            if message["role"] != "assistant":
+                if message_idx == 0:
+                    message_start_idx = 0
+                else:
+                    message_start_idx = self.tokenizer(
+                        self._concat_messages(messages[:message_idx]),
+                        return_tensors='pt',
+                        max_length=self.tokenizer.model_max_length,
+                        truncation=True
+                    ).input_ids.shape[1]
+                if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant":
+                    # here we also ignore the role of the assistant
+                    messages_so_far = self._concat_messages(messages[:message_idx + 1]) + self.ASSISTANT_PREFIX
+                else:
+                    messages_so_far = self._concat_messages(messages[:message_idx + 1])
+                message_end_idx = self.tokenizer(
+                    messages_so_far,
+                    return_tensors='pt',
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True
+                ).input_ids.shape[1]
+                labels[:, message_start_idx:message_end_idx] = IGNORE_INDEX
+
+                if message_end_idx >= self.tokenizer.model_max_length:
+                    break
+
+        attention_mask = torch.ones_like(input_ids)
+        return {
+            'input_ids': input_ids.flatten(),
+            'labels': labels.flatten(),
+            'attention_mask': attention_mask.flatten(),
         }
 
 
@@ -297,6 +379,15 @@ def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_typ
             chars_per_token=chars_per_token,
             dataset_text_field="text",
             shuffle=True,
+        )
+    elif dataset_type == "chat":
+        if not args.use_dynamic_padding and not args.disable_padding:
+            raise ValueError(
+                "Constant padding to max model length is not implemented for chat datasets, use --use_dynamic_padding."
+            )
+        dataset = ChatDataset(
+            data_path=path,
+            tokenizer=tokenizer,
         )
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
