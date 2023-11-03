@@ -298,6 +298,9 @@ class ScriptArguments:
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
+    tokenizer_name: Optional[str] = field(
+        default=None,
+    )
     use_dynamic_padding: bool = field(default=False)
     disable_padding: bool = field(default=False)
     use_new_pad_token: bool = field(default=False)
@@ -456,7 +459,7 @@ def create_and_prepare_model(args: ScriptArguments, training_args: TrainingArgum
         model.print_trainable_parameters()
 
     tokenizer = LlamaTokenizer.from_pretrained(
-        args.model_name,
+        args.model_name if args.tokenizer_name is None else args.tokenizer_name,
         model_max_length=args.max_seq_length,
         padding_side="right",
     )

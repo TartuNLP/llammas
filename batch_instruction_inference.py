@@ -95,6 +95,7 @@ def write_json(instructions: List[Dict[str, str]], file_path: str):
 
 def main(
         model_name: str,
+        tokenizer_name: Optional[str] = None,
         sharded_model_path: Optional[str] = None,
         output_file: str = "results.txt",
         full_output_file: Optional[str] = None,
@@ -180,7 +181,10 @@ def main(
         logging.info("Compiling model")
         model = torch.compile(model)
 
-    tokenizer = LlamaTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = LlamaTokenizer.from_pretrained(
+        model_name if tokenizer_name is None else tokenizer_name,
+        padding_side="left"
+    )
     tokenizer.pad_token_id = 0
 
     if input_format == "alpaca":
