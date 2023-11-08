@@ -13,7 +13,7 @@ from functools import partial
 from typing import Optional
 
 import torch
-from datasets import load_from_disk
+from datasets import interleave_datasets, load_dataset
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 from torch.optim import Optimizer
@@ -150,6 +150,7 @@ PROMPT_DICT = {
     ),
 }
 
+
 def read_json(path: str):
     with open(path, "r", encoding="utf-8") as user_file:
         parsed_json = json.load(user_file)
@@ -239,7 +240,8 @@ class ChatDataset(Dataset):
             raise ValueError('messages field is empty.')
 
         example_text = self._concat_messages(messages).strip()
-        tokenized_example = self.tokenizer(example_text, return_tensors='pt', max_length=self.tokenizer.model_max_length, truncation=True)
+        tokenized_example = self.tokenizer(example_text, return_tensors='pt',
+                                           max_length=self.tokenizer.model_max_length, truncation=True)
         input_ids = tokenized_example.input_ids
         labels = input_ids.clone()
 
@@ -304,6 +306,9 @@ class ScriptArguments:
     use_dynamic_padding: bool = field(default=False)
     disable_padding: bool = field(default=False)
     use_new_pad_token: bool = field(default=False)
+    interleave_probs: Optional[str] = field(default=None)
+    torch_dtype: Optional[str] = field(default=None)
+    low_cpu_mem_usage: bool = field(default=False)
 
 
 @dataclass
@@ -363,7 +368,7 @@ def get_chars_per_token(dataset: Dataset, tokenizer: LlamaTokenizer, data_column
     return total_characters / total_tokens
 
 
-def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_type: str, path: str):
+def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_type: str, path: str, seed: int):
     if dataset_type == "alpaca":
         dataset = InstructionDataset(
             data_path=path,
@@ -371,7 +376,39 @@ def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_typ
             padding=not args.use_dynamic_padding and not args.disable_padding,
         )
     elif dataset_type == "culturax":
-        raw_dataset = load_from_disk(path)
+        dataset_paths = list(path.split(","))
+        logging.info(f"Loading datasets from: {dataset_paths}")
+
+        culturax_datasets = []
+        for ds_path in dataset_paths:
+            logging.info(f"Loading {ds_path}")
+            if ":" in ds_path:
+                ds_name, lang = ds_path.split(":")
+                culturax_dataset = load_dataset(ds_name, language=lang, streaming=True, split="train")
+            else:
+                culturax_dataset = load_dataset(ds_path, streaming=True, split="train")
+
+        culturax_datasets.append(culturax_dataset)
+
+        if len(culturax_datasets) == 0:
+            raise ValueError("No datasets found")
+        elif len(culturax_datasets) == 1:
+            raw_dataset = culturax_datasets[0]
+        else:
+            if args.interleave_probs:
+                interleave_probs = [float(p) for p in args.interleave_probs.split(",")]
+            else:
+                interleave_probs = [1 / len(culturax_datasets)] * len(culturax_datasets)
+
+            logging.info(f"Interleave probabilities: {interleave_probs}")
+
+            raw_dataset = interleave_datasets(
+                culturax_datasets,
+                probabilities=interleave_probs,
+                seed=seed,
+                stopping_strategy="all_exhausted"
+            )
+
         chars_per_token = get_chars_per_token(raw_dataset, tokenizer, "text")
         logging.info(f"Chars per token: {chars_per_token}")
         dataset = ConstantLengthDataset(
@@ -399,8 +436,8 @@ def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_typ
 
 
 def create_datasets(tokenizer: LlamaTokenizer, args: ScriptArguments):
-    train_dataset = create_dataset(tokenizer, args, args.train_dataset_type, args.train_path)
-    valid_dataset = create_dataset(tokenizer, args, args.valid_dataset_type, args.valid_path)
+    train_dataset = create_dataset(tokenizer, args, args.train_dataset_type, args.train_path, seed=training_args.seed)
+    valid_dataset = create_dataset(tokenizer, args, args.valid_dataset_type, args.valid_path, seed=training_args.seed)
     return train_dataset, valid_dataset
 
 
@@ -432,13 +469,20 @@ def create_and_prepare_model(args: ScriptArguments, training_args: TrainingArgum
     if quant_args.use_4bit_quantization or quant_args.use_8bit_quantization:
         device_map = "auto"
 
+    if args.torch_dtype is None or args.torch_dtype == "auto":
+        torch_dtype = args.torch_dtype
+    else:
+        torch_dtype = getattr(torch, args.torch_dtype)
+
     model = LlamaForCausalLM.from_pretrained(
         args.model_name,
+        torch_dtype=torch_dtype,
         load_in_8bit=load_in_8bit,
         quantization_config=bnb_config,
         device_map=device_map,
         use_cache=not training_args.gradient_checkpointing,
         trust_remote_code=True,
+        low_cpu_mem_usage=args.low_cpu_mem_usage,
     )
 
     peft_config = None
@@ -586,7 +630,11 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
         logging.info("Using max length padding to max_seq_length")
         collator = default_data_collator
 
-    logging.info(f"Train dataset with {len(train_dataset)} examples")
+    try:
+        logging.info(f"Train dataset with {len(train_dataset)} examples")
+    except:
+        logging.info(f"Train dataset with unknown number of examples")
+
     logging.info(f"Validation dataset with {len(eval_dataset)} examples")
     logging.info(f"Max sequence length: {tokenizer.model_max_length}")
     trainer = CustomTrainer(
