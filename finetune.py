@@ -387,14 +387,15 @@ def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_typ
                 culturax_dataset = load_dataset(ds_name, language=lang, streaming=True, split="train")
             else:
                 culturax_dataset = load_dataset(ds_path, streaming=True, split="train")
-
-        culturax_datasets.append(culturax_dataset)
+            culturax_datasets.append(culturax_dataset)
 
         if len(culturax_datasets) == 0:
             raise ValueError("No datasets found")
         elif len(culturax_datasets) == 1:
+            logging.info("Loaded 1 dataset")
             raw_dataset = culturax_datasets[0]
         else:
+            logging.info(f"Loaded {len(culturax_datasets)} culturax datasets")
             if args.interleave_probs:
                 interleave_probs = [float(p) for p in args.interleave_probs.split(",")]
             else:
