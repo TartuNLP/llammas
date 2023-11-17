@@ -16,6 +16,78 @@ from tqdm import tqdm
 
 from transformers import LlamaTokenizer, LlamaForCausalLM, LlamaConfig
 
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:\n"
+    ),
+}
+
+
+class InstructionDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        item = self.data[index]
+
+        if item.get("input", "") == "":
+            prompt = PROMPT_DICT["prompt_no_input"].format_map(item)
+        else:
+            prompt = PROMPT_DICT["prompt_input"].format_map(item)
+
+        if "output" not in item:
+            return {"prompts": prompt}
+
+        return {"prompts": prompt, "labels": item["output"]}
+
+class ChatDataset(Dataset):
+    SYSTEM_PREFIX = "<|system|>\n"
+    SYSTEM_SUFFIX = "\n"
+    ASSISTANT_PREFIX = "<|assistant|>\n"
+    ASSISTANT_SUFFIX = "\n"
+    USER_PREFIX = "<|user|>\n"
+    USER_SUFFIX = "\n"
+
+    def __init__(self, data, tokenizer):
+        self.dataset = data
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _concat_messages(self, messages):
+        message_text = ""
+        for message in messages:
+            if message["role"] == "system":
+                message_text += self.SYSTEM_PREFIX + message["content"].strip() + self.SYSTEM_SUFFIX
+            elif message["role"] == "user":
+                message_text += self.USER_PREFIX + message["content"].strip() + self.USER_SUFFIX
+            elif message["role"] == "assistant":
+                message_text += self.ASSISTANT_PREFIX + message["content"].strip() + self.tokenizer.eos_token \
+                                + self.ASSISTANT_SUFFIX
+            else:
+                raise ValueError("Invalid role: {}".format(message["role"]))
+        return message_text
+
+    def __getitem__(self, index):
+        messages = self.dataset[index]["messages"]
+        if len(messages) == 0:
+            raise ValueError('messages field is empty.')
+
+        example_text = self._concat_messages(messages) + self.ASSISTANT_PREFIX
+        return {"prompts": example_text}
+
+
 def write_json(instructions: List[Dict[str, str]], file_path: str):
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(instructions, f, indent=4, default=str)
@@ -35,9 +107,13 @@ def get_dataLoader(task, data, batch_size):
 
 def main(
         model_name: str,
+        tokenizer_name: Optional[str] = None,
         sharded_model_path: Optional[str] = None,
         output_file: str = "results.txt",
         full_output_file: Optional[str] = None,
+        input_format: str = "alpaca",
+        fp16: bool = False,
+        bf16: bool = False,
         quantization: bool = False,
         compile_model: bool = False,
         max_new_tokens: int = 100,
@@ -91,7 +167,7 @@ def main(
                 device_map="auto",
                 return_dict=True,
                 low_cpu_mem_usage=True
-        )
+
     else:
         logging.info("Loading sharded model")
         if quantization:
@@ -116,18 +192,40 @@ def main(
         )
         model.load_state_dict(state_dict["model"])
         logging.info(f"model device {next(model.parameters()).device}")
+
+        if bf16:
+            model = model.bfloat16()
+        elif fp16:
+            model = model.half()
+
         model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         logging.info(f"model device before prediction: {next(model.parameters()).device}")
 
+    model.eval()
     if compile_model:
         logging.info("Compiling model")
         model = torch.compile(model)
 
-    model.eval()
-    tokenizer = LlamaTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = LlamaTokenizer.from_pretrained(
+        model_name if tokenizer_name is None else tokenizer_name,
+        padding_side="left"
+    )
     tokenizer.pad_token_id = 0
 
-    val_dataloader = get_dataLoader(task, data, batch_size)
+    if input_format == "alpaca":
+        val_data = get_dataLoader(task, data, batch_size)
+    elif input_format == "chat":
+        val_data = ChatDataset(data, tokenizer)
+    else:
+        raise ValueError(f"Invalid input format: {input_format}")
+
+    val_dataloader = torch.utils.data.DataLoader(
+        val_data,
+        batch_size=batch_size,
+        num_workers=1,
+        pin_memory=True,
+        drop_last=False
+    )
 
     full_output = []
     translations = []
@@ -160,7 +258,7 @@ def main(
             # Could use batch decode here but I want to process each one separately.
             for ix, output in enumerate(outputs):
                 prediction = tokenizer.decode(output[len(batch["input_ids"][ix]):], skip_special_tokens=True)
-                raw_output = tokenizer.decode(output, skip_special_tokens=True)
+                raw_output = prediction
 
                 if("\n" in prediction):
                     print("Predictions has newlines")
@@ -174,8 +272,8 @@ def main(
                 full_output.append({"input": data_batch["prompts"][ix], "raw_output": raw_output, "output": prediction})
 
                 if print_output:
-                    logging.info(f"input-{ix}:\t{data_batch['prompts'][ix]}")
-                    logging.info(f"raw-output-{ix}:\t{raw_output}")
+                    logging.info(f"input-escaped-{ix}:\t{repr(data_batch['prompts'][ix])}")
+                    logging.info(f"raw-output-escaped-{ix}:\t{repr(raw_output)}")
                     logging.info(f"processed-output-{ix}: {prediction}")
 
     if full_output_file is not None:

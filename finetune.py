@@ -1,22 +1,141 @@
 # Adapted from https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/train.py
 # and https://github.com/facebookresearch/llama-recipes
-
 import copy
 import json
 import logging
+import math
 import os
+import random
 import sys
+import warnings
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Optional
 
 import torch
+from datasets import interleave_datasets, load_dataset
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 from transformers import HfArgumentParser, TrainingArguments, Trainer, LlamaForCausalLM, LlamaTokenizer, \
-    default_data_collator, DataCollatorForSeq2Seq, get_polynomial_decay_schedule_with_warmup, \
-    get_cosine_schedule_with_warmup
-from torch.utils.data import Dataset
+    default_data_collator, DataCollatorForSeq2Seq, get_polynomial_decay_schedule_with_warmup
+from torch.utils.data import Dataset, IterableDataset
 from transformers.utils import PaddingStrategy
+
+
+# implementation from TRL: https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py
+class ConstantLengthDataset(IterableDataset):
+    """
+    Iterable dataset that returns constant length chunks of tokens from stream of text files.
+    The dataset also formats the text before tokenization with a specific format that is provided
+    by the user.
+
+        Args:
+            tokenizer (`transformers.PreTrainedTokenizer`):
+                The processor used for processing the data.
+            dataset (`dataset.Dataset`):
+                Dataset with text files.
+            dataset_text_field (`str`, **optional**):
+                Name of the field in the dataset that contains the text. Used only if `formatting_func` is `None`.
+            formatting_func (`Callable`, **optional**):
+                Function that formats the text before tokenization. Usually it is recommended to have follows a certain
+                pattern such as `"### Question: {question}\n ### Answer: {answer}\n"`
+            infinite (`bool`, *optional*, defaults to `False`):
+                If True the iterator is reset after dataset reaches end else stops.
+            seq_length (`int`, *optional*, defaults to `1024`):
+                Length of token sequences to return.
+            num_of_sequences (`int`, *optional*, defaults to `1024`):
+                Number of token sequences to keep in buffer.
+            chars_per_token (`int`, *optional*, defaults to `3.6`):
+                Number of characters per token used to estimate number of tokens in text buffer.
+            eos_token_id (`int`, *optional*, defaults to `0`):
+                Id of the end of sequence token if the passed tokenizer does not have an EOS token.
+            shuffle ('bool', *optional*, defaults to True)
+                Shuffle the examples before they are returned
+    """
+
+    def __init__(
+            self,
+            tokenizer,
+            dataset,
+            dataset_text_field=None,
+            formatting_func=None,
+            infinite=False,
+            seq_length=1024,
+            num_of_sequences=1024,
+            chars_per_token=3.6,
+            eos_token_id=0,
+            shuffle=True,
+    ):
+        self.tokenizer = tokenizer
+
+        if tokenizer.eos_token_id is None:
+            warnings.warn(
+                "The passed tokenizer does not have an EOS token. We will use the passed eos_token_id instead which corresponds"
+                f" to {eos_token_id}. If this is not the correct EOS token, make sure to pass the correct eos_token_id."
+            )
+
+        self.concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
+        self.dataset = dataset
+        self.seq_length = seq_length
+        self.infinite = infinite
+        self.current_size = 0
+        self.max_buffer_size = seq_length * chars_per_token * num_of_sequences
+        self.shuffle = shuffle
+        if formatting_func is None:
+            self.formatting_func = lambda x: x[dataset_text_field]
+        else:
+            self.formatting_func = formatting_func
+
+        if formatting_func is not None:
+            formatting_func_signature = formatting_func.__code__.co_varnames
+            if len(formatting_func_signature) > 1:
+                warnings.warn(
+                    "The passed formatting_func has more than one argument. Usually that function should have a single argument `example`"
+                    " which corresponds to the dictionary returned by each element of the dataset. Make sure you know what you are doing."
+                )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __iter__(self):
+        iterator = iter(self.dataset)
+        more_examples = True
+        while more_examples:
+            buffer, buffer_len = [], 0
+            while True:
+                if buffer_len >= self.max_buffer_size:
+                    break
+                try:
+                    buffer.append(self.formatting_func(next(iterator)))
+                    buffer_len += len(buffer[-1])
+                except StopIteration:
+                    if self.infinite:
+                        iterator = iter(self.dataset)
+                        warnings.warn("The dataset reached end and the iterator is reset to the start.")
+                    else:
+                        more_examples = False
+                        break
+            tokenized_inputs = self.tokenizer(buffer, truncation=False)["input_ids"]
+            all_token_ids = []
+            for tokenized_input in tokenized_inputs:
+                all_token_ids.extend(tokenized_input + [self.concat_token_id])
+            examples = []
+            for i in range(0, len(all_token_ids), self.seq_length):
+                input_ids = all_token_ids[i: i + self.seq_length]
+                if len(input_ids) == self.seq_length:
+                    examples.append(input_ids)
+            if self.shuffle:
+                random.shuffle(examples)
+            for example in examples:
+                self.current_size += 1
+                yield {
+                    "input_ids": torch.LongTensor(example),
+                    "labels": torch.LongTensor(example),
+                }
+
 
 PROMPT_DICT = {
     "prompt_input": (
@@ -32,9 +151,15 @@ PROMPT_DICT = {
 }
 
 
+def read_json(path: str):
+    with open(path, "r", encoding="utf-8") as user_file:
+        parsed_json = json.load(user_file)
+    return parsed_json
+
+
 class InstructionDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: LlamaTokenizer, padding=True):
-        self.dataset = json.load(open(data_path))
+        self.dataset = read_json(data_path)
         self.padding = padding
         self.tokenizer = tokenizer
 
@@ -78,10 +203,96 @@ class InstructionDataset(Dataset):
         }
 
 
+class ChatDataset(Dataset):
+    SYSTEM_PREFIX = "<|system|>\n"
+    SYSTEM_SUFFIX = "\n"
+    ASSISTANT_PREFIX = "<|assistant|>\n"
+    ASSISTANT_SUFFIX = "\n"
+    USER_PREFIX = "<|user|>\n"
+    USER_SUFFIX = "\n"
+
+    def __init__(self, data_path: str, tokenizer: LlamaTokenizer):
+        self.dataset = read_json(data_path)
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _concat_messages(self, messages):
+        message_text = ""
+        for message in messages:
+            if message["role"] == "system":
+                message_text += self.SYSTEM_PREFIX + message["content"].strip() + self.SYSTEM_SUFFIX
+            elif message["role"] == "user":
+                message_text += self.USER_PREFIX + message["content"].strip() + self.USER_SUFFIX
+            elif message["role"] == "assistant":
+                message_text += self.ASSISTANT_PREFIX + message["content"].strip() + self.tokenizer.eos_token \
+                                + self.ASSISTANT_SUFFIX
+            else:
+                raise ValueError("Invalid role: {}".format(message["role"]))
+        return message_text
+
+    def __getitem__(self, index):
+        IGNORE_INDEX = -100
+
+        messages = self.dataset[index]["messages"]
+        if len(messages) == 0:
+            raise ValueError('messages field is empty.')
+
+        example_text = self._concat_messages(messages).strip()
+        tokenized_example = self.tokenizer(example_text, return_tensors='pt',
+                                           max_length=self.tokenizer.model_max_length, truncation=True)
+        input_ids = tokenized_example.input_ids
+        labels = input_ids.clone()
+
+        # mask the non-assistant part for avoiding loss
+        for message_idx, message in enumerate(messages):
+            if message["role"] != "assistant":
+                if message_idx == 0:
+                    message_start_idx = 0
+                else:
+                    message_start_idx = self.tokenizer(
+                        self._concat_messages(messages[:message_idx]),
+                        return_tensors='pt',
+                        max_length=self.tokenizer.model_max_length,
+                        truncation=True
+                    ).input_ids.shape[1]
+                if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant":
+                    # here we also ignore the role of the assistant
+                    messages_so_far = self._concat_messages(messages[:message_idx + 1]) + self.ASSISTANT_PREFIX
+                else:
+                    messages_so_far = self._concat_messages(messages[:message_idx + 1])
+                message_end_idx = self.tokenizer(
+                    messages_so_far,
+                    return_tensors='pt',
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True
+                ).input_ids.shape[1]
+                labels[:, message_start_idx:message_end_idx] = IGNORE_INDEX
+
+                if message_end_idx >= self.tokenizer.model_max_length:
+                    break
+
+        attention_mask = torch.ones_like(input_ids)
+        return {
+            'input_ids': input_ids.flatten(),
+            'labels': labels.flatten(),
+            'attention_mask': attention_mask.flatten(),
+        }
+
+
 @dataclass
 class ScriptArguments:
-    train_path: str = field(metadata={"help": "Training data json path"})
-    valid_path: str = field(metadata={"help": "Validation data json path"})
+    train_path: str = field(metadata={"help": "Training data path"})
+    valid_path: str = field(metadata={"help": "Validation data path"})
+    train_dataset_type: str = field(
+        default="alpaca",
+        metadata={"help": "Training dataset type"}
+    )
+    valid_dataset_type: str = field(
+        default="alpaca",
+        metadata={"help": "Validation dataset type"}
+    )
     max_seq_length: Optional[int] = field(default=512)
     model_name: Optional[str] = field(
         default="meta-llama/Llama-2-7b-hf",
@@ -89,12 +300,15 @@ class ScriptArguments:
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
-    use_better_transformer: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables Flash attention for training."},
+    tokenizer_name: Optional[str] = field(
+        default=None,
     )
     use_dynamic_padding: bool = field(default=False)
+    disable_padding: bool = field(default=False)
     use_new_pad_token: bool = field(default=False)
+    interleave_probs: Optional[str] = field(default=None)
+    torch_dtype: Optional[str] = field(default=None)
+    low_cpu_mem_usage: bool = field(default=False)
 
 
 @dataclass
@@ -140,19 +354,91 @@ class QuantizationArguments:
     )
 
 
-def create_datasets(tokenizer, args: ScriptArguments):
-    train_dataset = InstructionDataset(
-        data_path=args.train_path,
-        tokenizer=tokenizer,
-        padding=not args.use_dynamic_padding,
-    )
+# https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/utils.py#L116C1-L125C43
+def get_chars_per_token(dataset: Dataset, tokenizer: LlamaTokenizer, data_column: str, nb_examples: int = 500):
+    """
+    Estimate the average number of characters per token in the dataset.
+    """
+    logging.info("Estimating average number of characters per token in the dataset...")
+    total_characters, total_tokens = 0, 0
+    for _, example in tqdm(zip(range(nb_examples), iter(dataset)), total=nb_examples):
+        total_characters += len(example[data_column])
+        total_tokens += len(tokenizer.encode(example[data_column], truncation=False, padding=False))
 
-    valid_dataset = InstructionDataset(
-        data_path=args.valid_path,
-        tokenizer=tokenizer,
-        padding=not args.use_dynamic_padding,
-    )
+    return total_characters / total_tokens
 
+
+def create_dataset(tokenizer: LlamaTokenizer, args: ScriptArguments, dataset_type: str, path: str, seed: int):
+    if dataset_type == "alpaca":
+        dataset = InstructionDataset(
+            data_path=path,
+            tokenizer=tokenizer,
+            padding=not args.use_dynamic_padding and not args.disable_padding,
+        )
+    elif dataset_type == "culturax":
+        dataset_paths = list(path.split(","))
+        logging.info(f"Loading datasets from: {dataset_paths}")
+
+        culturax_datasets = []
+        for ds_path in dataset_paths:
+            logging.info(f"Loading {ds_path}")
+            if ":" in ds_path:
+                ds_name, lang = ds_path.split(":")
+                culturax_dataset = load_dataset(ds_name, language=lang, streaming=True, split="train")
+            else:
+                culturax_dataset = load_dataset(ds_path, streaming=True, split="train")
+            culturax_datasets.append(culturax_dataset)
+
+        if len(culturax_datasets) == 0:
+            raise ValueError("No datasets found")
+        elif len(culturax_datasets) == 1:
+            logging.info("Loaded 1 dataset")
+            raw_dataset = culturax_datasets[0]
+        else:
+            logging.info(f"Loaded {len(culturax_datasets)} culturax datasets")
+            if args.interleave_probs:
+                interleave_probs = [float(p) for p in args.interleave_probs.split(",")]
+            else:
+                interleave_probs = [1 / len(culturax_datasets)] * len(culturax_datasets)
+
+            logging.info(f"Interleave probabilities: {interleave_probs}")
+
+            raw_dataset = interleave_datasets(
+                culturax_datasets,
+                probabilities=interleave_probs,
+                seed=seed,
+                stopping_strategy="all_exhausted"
+            )
+
+        chars_per_token = get_chars_per_token(raw_dataset, tokenizer, "text")
+        logging.info(f"Chars per token: {chars_per_token}")
+        dataset = ConstantLengthDataset(
+            tokenizer,
+            raw_dataset,
+            infinite=True,
+            seq_length=args.max_seq_length,
+            chars_per_token=chars_per_token,
+            dataset_text_field="text",
+            shuffle=True,
+        )
+    elif dataset_type == "chat":
+        if not args.use_dynamic_padding and not args.disable_padding:
+            raise ValueError(
+                "Constant padding to max model length is not implemented for chat datasets, use --use_dynamic_padding."
+            )
+        dataset = ChatDataset(
+            data_path=path,
+            tokenizer=tokenizer,
+        )
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
+
+    return dataset
+
+
+def create_datasets(tokenizer: LlamaTokenizer, args: ScriptArguments):
+    train_dataset = create_dataset(tokenizer, args, args.train_dataset_type, args.train_path, seed=training_args.seed)
+    valid_dataset = create_dataset(tokenizer, args, args.valid_dataset_type, args.valid_path, seed=training_args.seed)
     return train_dataset, valid_dataset
 
 
@@ -184,17 +470,21 @@ def create_and_prepare_model(args: ScriptArguments, training_args: TrainingArgum
     if quant_args.use_4bit_quantization or quant_args.use_8bit_quantization:
         device_map = "auto"
 
+    if args.torch_dtype is None or args.torch_dtype == "auto":
+        torch_dtype = args.torch_dtype
+    else:
+        torch_dtype = getattr(torch, args.torch_dtype)
+
     model = LlamaForCausalLM.from_pretrained(
         args.model_name,
+        torch_dtype=torch_dtype,
         load_in_8bit=load_in_8bit,
         quantization_config=bnb_config,
         device_map=device_map,
         use_cache=not training_args.gradient_checkpointing,
         trust_remote_code=True,
+        low_cpu_mem_usage=args.low_cpu_mem_usage,
     )
-    if args.use_better_transformer:
-        from optimum.bettertransformer import BetterTransformer
-        model = BetterTransformer.transform(model)
 
     peft_config = None
     if lora_args.use_peft_lora:
@@ -214,16 +504,20 @@ def create_and_prepare_model(args: ScriptArguments, training_args: TrainingArgum
         model.print_trainable_parameters()
 
     tokenizer = LlamaTokenizer.from_pretrained(
-        args.model_name,
+        args.model_name if args.tokenizer_name is None else args.tokenizer_name,
         model_max_length=args.max_seq_length,
         padding_side="right",
     )
     if args.use_new_pad_token:
         tokenizer.add_special_tokens(
             {
-                "pad_token": "<PAD>",
+                "pad_token": "<pad>",
             }
         )
+        model.resize_token_embeddings(len(tokenizer))
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.model.padding_idx = tokenizer.pad_token_id
+        model.model.embed_tokens.padding_idx = tokenizer.pad_token_id
     else:
         tokenizer.pad_token_id = 0
 
@@ -248,6 +542,38 @@ class CustomTrainingArguments(TrainingArguments):
     scheduler_lr_end: float = None
 
 
+def _get_cosine_schedule_with_warmup_lr_lambda(
+        current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: float, lr_init: float = 1,
+        lr_end: float = 0
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    relative_lr_end = lr_end / lr_init
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))) * (
+            1 - relative_lr_end) + relative_lr_end
+
+
+def get_cosine_schedule_with_warmup_end_lr(
+        optimizer: Optimizer,
+        num_warmup_steps: int,
+        num_training_steps: int,
+        num_cycles: float = 0.5,
+        last_epoch: int = -1,
+        lr_end: float = 0,
+):
+    lr_init = optimizer.defaults["lr"]
+    lr_lambda = partial(
+        _get_cosine_schedule_with_warmup_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_cycles=num_cycles,
+        lr_init=lr_init,
+        lr_end=lr_end,
+    )
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
 class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         if (
@@ -266,7 +592,7 @@ class CustomTrainer(Trainer):
                     num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
                 )
             elif self.args.lr_scheduler_type == "cosine":
-                self.lr_scheduler = get_cosine_schedule_with_warmup(
+                self.lr_scheduler = get_cosine_schedule_with_warmup_end_lr(
                     optimizer=self.optimizer if optimizer is None else optimizer,
                     lr_end=self.args.scheduler_lr_end,
                     num_training_steps=num_training_steps,
@@ -284,14 +610,13 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
          lora_args: LoraArguments):
     torch.cuda.manual_seed(training_args.seed)
     torch.manual_seed(training_args.seed)
+    random.seed(training_args.seed)
 
-    # model
     model, peft_config, tokenizer = create_and_prepare_model(
         script_args, training_args, lora_args, quantization_args
     )
     model.config.use_cache = False
 
-    # datasets
     train_dataset, eval_dataset = create_datasets(tokenizer, args)
     if args.use_dynamic_padding:
         logging.info("Using dynamic padding")
@@ -306,10 +631,13 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
         logging.info("Using max length padding to max_seq_length")
         collator = default_data_collator
 
-    logging.info(f"Train dataset with {len(train_dataset)} examples")
+    try:
+        logging.info(f"Train dataset with {len(train_dataset)} examples")
+    except:
+        logging.info(f"Train dataset with unknown number of examples")
+
     logging.info(f"Validation dataset with {len(eval_dataset)} examples")
     logging.info(f"Max sequence length: {tokenizer.model_max_length}")
-    # trainer
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -322,17 +650,10 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments, quantiz
         trainer.model.print_trainable_parameters()
         peft_module_casting_to_bf16(trainer.model, training_args)
 
-    # train
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
-    # saving final model
     if trainer.is_fsdp_enabled:
         trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
-
-    if args.use_better_transformer:
-        from optimum.bettertransformer import BetterTransformer
-        trainer.model = BetterTransformer.reverse(trainer.model)
-        model = trainer.model
 
     trainer.save_model(training_args.output_dir)
 
