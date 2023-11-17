@@ -9,48 +9,28 @@ import sys
 import json
 
 import torch
-from torch.utils.data import Dataset
+from datasets import ValidationDataset, EstQADataset
 import torch.distributed._shard.checkpoint as dist_cp
 from torch.distributed.checkpoint import FileSystemReader
 from tqdm import tqdm
 
 from transformers import LlamaTokenizer, LlamaForCausalLM, LlamaConfig
 
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:\n"
-    ),
-}
-
-
-class ValidationDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        item = self.data[index]
-
-        if item.get("input", "") == "":
-            prompt = PROMPT_DICT["prompt_no_input"].format_map(item)
-        else:
-            prompt = PROMPT_DICT["prompt_input"].format_map(item)
-
-        return {"prompts": prompt, "labels": item["output"]}
-
-
 def write_json(instructions: List[Dict[str, str]], file_path: str):
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(instructions, f, indent=4, default=str)
+
+
+def get_dataLoader(task, data, batch_size):
+    if task.lower() == "estqa":
+        logging.info("getting estQA dataloader")
+        val_data = EstQADataset(data)
+    else:
+        logging.info(f"getting normal dataloader for task {task}")
+        val_data = ValidationDataset(data)
+
+    return torch.utils.data.DataLoader(
+        val_data, batch_size=batch_size, num_workers=1, pin_memory=True, drop_last=False)
 
 
 def main(
@@ -61,6 +41,8 @@ def main(
         quantization: bool = False,
         compile_model: bool = False,
         max_new_tokens: int = 100,
+        task: str = None,
+        use_flash_attention: bool = False,
         prompt_file: str = None,
         seed: int = 42,
         do_sample: bool = True,
@@ -91,12 +73,24 @@ def main(
 
     if sharded_model_path is None:
         logging.info("Loading model")
-        model = LlamaForCausalLM.from_pretrained(
-            model_name,
-            load_in_8bit=quantization,
-            device_map="auto",
-            return_dict=True,
-            low_cpu_mem_usage=True,
+        if use_flash_attention:
+            logging.info(f"Loading model with flash attention")
+            model = LlamaForCausalLM.from_pretrained(
+                model_name,
+                load_in_8bit=quantization,
+                device_map="auto",
+                return_dict=True,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.bfloat16, 
+                use_flash_attention_2=True,
+                )
+        else:
+            model = LlamaForCausalLM.from_pretrained(
+                model_name,
+                load_in_8bit=quantization,
+                device_map="auto",
+                return_dict=True,
+                low_cpu_mem_usage=True
         )
     else:
         logging.info("Loading sharded model")
@@ -133,14 +127,7 @@ def main(
     tokenizer = LlamaTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token_id = 0
 
-    val_data = ValidationDataset(data)
-    val_dataloader = torch.utils.data.DataLoader(
-        val_data,
-        batch_size=batch_size,
-        num_workers=1,
-        pin_memory=True,
-        drop_last=False
-    )
+    val_dataloader = get_dataLoader(task, data, batch_size)
 
     full_output = []
     translations = []
@@ -174,6 +161,11 @@ def main(
             for ix, output in enumerate(outputs):
                 prediction = tokenizer.decode(output[len(batch["input_ids"][ix]):], skip_special_tokens=True)
                 raw_output = tokenizer.decode(output, skip_special_tokens=True)
+
+                if("\n" in prediction):
+                    print("Predictions has newlines")
+                    print(prediction)
+                    print("-"*10)
 
                 prediction = prediction.replace("\n", " ").strip()
                 translations.append(prediction)
