@@ -9,7 +9,7 @@ import sys
 import json
 
 import torch
-from datasets import ValidationDataset, EstQADataset, ChatDataset, InstructionDataset
+from datasets import EstQADataset, ChatDataset, InstructionDataset
 import torch.distributed._shard.checkpoint as dist_cp
 from torch.distributed.checkpoint import FileSystemReader
 from tqdm import tqdm
@@ -23,15 +23,13 @@ def write_json(instructions: List[Dict[str, str]], file_path: str):
 
 def get_dataLoader(task, data, batch_size):
     if task.lower() == "estqa":
-        logging.info("getting estQA dataloader")
+        logging.info("Getting estQA dataloader")
         val_data = EstQADataset(data)
     else:
-        logging.info(f"getting normal dataloader for task {task}")
-        val_data = ValidationDataset(data)
+        logging.info(f"Getting general dataloader for task {task}")
+        val_data = InstructionDataset(data)
 
-    return torch.utils.data.DataLoader(
-        val_data, batch_size=batch_size, num_workers=1, pin_memory=True, drop_last=False)
-
+    return val_data
 
 def main(
         model_name: str,
