@@ -1,4 +1,5 @@
-# Llammas 🐑 - Llama-2 adapted to Estonian
+# Llammas 🐑
+*Adapting Llama-2 to Estonian*
 
 This repository contains the fine-tuning, inference and data formating scripts for fine-tuning and continued-pretraining of Llama-2 for Estonian.
 
