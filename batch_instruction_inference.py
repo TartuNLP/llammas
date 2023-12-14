@@ -9,7 +9,7 @@ import sys
 import json
 
 import torch
-from datasets import EstQADataset, ChatDataset, InstructionDataset
+from inference_datasets import EstQADataset, ChatDataset, InstructionDataset
 import torch.distributed._shard.checkpoint as dist_cp
 from torch.distributed.checkpoint import FileSystemReader
 from tqdm import tqdm
@@ -181,15 +181,12 @@ def main(
                     **kwargs
                 )
 
-            # Could use batch decode here but I want to process each one separately.
             for ix, output in enumerate(outputs):
                 prediction = tokenizer.decode(output[len(batch["input_ids"][ix]):], skip_special_tokens=True)
                 raw_output = prediction
 
                 if("\n" in prediction):
-                    print("Predictions has newlines")
-                    print(prediction)
-                    print("-"*10)
+                    logging.debug(f"Found newline in prediction {ix}")
 
                 prediction = prediction.replace("\n", " ").strip()
                 translations.append(prediction)
