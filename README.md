@@ -9,6 +9,11 @@ The [scripts](./scripts) directory contains example scripts for:
 * [scripts/translation_data](./scripts/translation_data) for bitext creation and formating into Estonian/English instructions.
 
 For instructions used to train the model:
-* Alpaca-est
+* [Alpaca-est (ours)](https://github.com/TartuNLP/alpaca-est)
 * [Alpaca-cleaned](https://github.com/gururise/AlpacaDataCleaned)
 * [open-instruct](https://github.com/allenai/open-instruct)
+
+Trained model checkpoints:
+* [Llammas](https://huggingface.co/tartuNLP/Llammas) (conversational/instruction-tuned)
+* [Llammas-base](https://huggingface.co/tartuNLP/Llammas-base)
+* [Llammas-translate](https://huggingface.co/tartuNLP/Llammas-translate) (conversational/instruction-tuned with focus on translation)
