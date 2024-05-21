@@ -17,3 +17,15 @@ Trained model checkpoints:
 * [Llammas](https://huggingface.co/tartuNLP/Llammas) (conversational/instruction-tuned)
 * [Llammas-base](https://huggingface.co/tartuNLP/Llammas-base)
 * [Llammas-translate](https://huggingface.co/tartuNLP/Llammas-translate) (conversational/instruction-tuned with focus on translation)
+
+### Citation
+```
+@misc{kuulmets2024teaching,
+      title={Teaching Llama a New Language Through Cross-Lingual Knowledge Transfer}, 
+      author={Hele-Andra Kuulmets and Taido Purason and Agnes Luhtaru and Mark Fishel},
+      year={2024},
+      eprint={2404.04042},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+}
+```
